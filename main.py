@@ -372,9 +372,8 @@ async def mp_webhook(request: Request):
     if status != old_status:
         await db_update_status(str(payment_id), status)
 
-if status == "approved" and old_status != "approved":
-    await grant_access(int(telegram_id))
-
+    if status == "approved":
+        await grant_access(int(telegram_id))
 
     return JSONResponse({"ok": True, "status": status, "topic": topic})
 
@@ -391,3 +390,4 @@ async def on_startup():
 @app.get("/")
 async def root():
     return {"ok": True, "service": "telegram-vip-bot"}
+
