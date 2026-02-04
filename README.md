@@ -1,1 +1,1 @@
-# telegram_vip_bot
+Telegram VIP Bot - Mercado Pago + Canal Privado
