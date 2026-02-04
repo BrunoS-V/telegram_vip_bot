@@ -249,18 +249,24 @@ def kb_back():
 @dp.message(Command("start"))
 async def cmd_start(msg: Message):
     await msg.answer(
-        f"✅ Bem-vindo!\n\n"
-        f"Produto: {PRODUCT_NAME}\n\n"
-        f"Escolha um plano abaixo 👇",
+        f"🚀 *Bem-vindo ao acesso VIP!*\n\n"
+        f"Aqui você entra para o *{PRODUCT_NAME}* e recebe:\n"
+        f"✅ Conteúdo exclusivo\n"
+        f"✅ Atualizações frequentes\n"
+        f"✅ Acesso imediato após o pagamento\n\n"
+        f"💳 *Escolha seu plano abaixo:*",
+        parse_mode="Markdown",
         reply_markup=kb_main()
     )
 
 @dp.message(Command("planos"))
 async def cmd_planos(msg: Message):
     await msg.answer(
-        f"📌 Planos:\n\n"
-        f"• 30 dias — R$ {PRICE_30:.2f}\n"
-        f"• Vitalícia — R$ {PRICE_LIFE:.2f}\n",
+        f"💎 *PLANOS DISPONÍVEIS*\n\n"
+        f"🗓 *30 dias de acesso* — R$ {PRICE_30:.2f}\n"
+        f"♾ *Acesso vitalício* — R$ {PRICE_LIFE:.2f}\n\n"
+        f"Pagamento via PIX com liberação automática 🔓",
+        parse_mode="Markdown",
         reply_markup=kb_main()
     )
 
@@ -298,7 +304,8 @@ async def cb_support(c: CallbackQuery):
 @dp.callback_query(F.data == "back")
 async def cb_back(c: CallbackQuery):
     await c.message.edit_text(
-        f"Escolha um plano abaixo 👇",
+        "💳 *Escolha seu plano abaixo:*",
+        parse_mode="Markdown",
         reply_markup=kb_main()
     )
     await c.answer()
@@ -311,7 +318,7 @@ async def cb_choose_plan(c: CallbackQuery, state: FSMContext):
 
     texto = "30 dias" if plan == "30d" else "Vitalícia"
     await c.message.answer(
-        f"Você escolheu: *{texto}*\n\n"
+        f"✅ Você escolheu: *{texto}*\n\n"
         "Agora me envie seu *e-mail* (obrigatório pelo Mercado Pago).",
         parse_mode="Markdown",
         reply_markup=kb_back()
@@ -364,13 +371,14 @@ async def on_email(msg: Message, state: FSMContext):
         except Exception:
             pass
 
-    # Envia copia e cola
+    # Envia copia e cola (MELHORADO)
     if copia:
         await msg.answer(
-            "✅ PIX gerado!\n\n"
-            "📋 *Copia e Cola (PIX):*\n"
+            "💰 *Pagamento criado com sucesso!*\n\n"
+            "📋 *PIX Copia e Cola:*\n"
             f"`{copia}`\n\n"
-            "Assim que o pagamento for aprovado, eu libero o acesso automaticamente. 🔓",
+            "⏳ Assim que o pagamento for confirmado, seu acesso será liberado automaticamente.\n\n"
+            "⚠️ Não feche esta conversa até finalizar o pagamento.",
             parse_mode="Markdown"
         )
     else:
@@ -427,13 +435,10 @@ async def cb_my_sub(c: CallbackQuery):
     now = datetime.now(timezone.utc)
 
     if now < exp:
-        restante = exp - now
-        dias = max(restante.days, 0)
         await c.message.answer(
-            f"✅ Assinatura *ativa*\n"
-            f"📅 Expira em: *{exp.astimezone().strftime('%d/%m/%Y %H:%M')}*\n"
-            f"⏳ Restam: *{dias} dia(s)*\n\n"
-            "Vou gerar um link novo pra você entrar 👇",
+            f"✅ *Assinatura ativa*\n"
+            f"📅 Válida até: *{exp.astimezone().strftime('%d/%m/%Y %H:%M')}*\n\n"
+            "Vou gerar um novo link de acesso para você 👇",
             parse_mode="Markdown"
         )
         await grant_access(telegram_id)
@@ -470,9 +475,13 @@ async def grant_access(telegram_id: int):
         )
         await bot.send_message(
             telegram_id,
-            "✅ Aqui está seu link de acesso (1 uso / expira em 10 min):\n"
+            "🎉 *Pagamento aprovado!*\n\n"
+            "🔓 Seu acesso está liberado.\n"
+            "Use o link abaixo para entrar no canal VIP:\n\n"
             f"{invite.invite_link}\n\n"
-            "Se expirar, clique em 📌 Minha assinatura para gerar outro.",
+            "⚠️ Este link expira em 10 minutos e só pode ser usado uma vez.\n"
+            "Se perder o acesso, toque em *📌 Minha assinatura*.",
+            parse_mode="Markdown"
         )
     except Exception:
         await bot.send_message(
