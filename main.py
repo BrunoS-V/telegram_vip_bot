@@ -3,10 +3,9 @@ import re
 import base64
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import aiosqlite
-import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -21,30 +20,33 @@ from aiogram.types import (
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types.input_file import BufferedInputFile
 
 
 # =========================
 # ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN", "").strip()
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 
 PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Acesso Canal VIP").strip()
 CURRENCY = os.getenv("CURRENCY", "BRL").strip()
 
-# Preços e duração
-PRICE_30 = float(os.getenv("PRICE_30", os.getenv("PRICE", "29.90")))
-PRICE_LIFE = float(os.getenv("PRICE_LIFE", "149.90"))
+# Planos
+PRICE_30 = float(os.getenv("PRICE_30", "9.99"))
+PRICE_LIFE = float(os.getenv("PRICE_LIFE", "19.99"))
 SUB_DAYS = int(os.getenv("SUB_DAYS", "30"))
+
+# Kiwify (seus links)
+KIWIFY_LINK_30 = os.getenv("KIWIFY_LINK_30", "https://pay.kiwify.com.br/TvLqICI").strip()
+KIWIFY_LINK_LIFE = os.getenv("KIWIFY_LINK_LIFE", "https://pay.kiwify.com.br/PAd2mH9").strip()
+
+# Webhook token (opcional, mas recomendado)
+KIWIFY_WEBHOOK_TOKEN = os.getenv("KIWIFY_WEBHOOK_TOKEN", "").strip()
 
 DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN não configurado")
-if not MP_ACCESS_TOKEN:
-    raise RuntimeError("MP_ACCESS_TOKEN não configurado")
 
 
 # =========================
@@ -60,14 +62,14 @@ app = FastAPI()
 # =========================
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS payments (
-  mp_payment_id TEXT PRIMARY KEY,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   telegram_id INTEGER NOT NULL,
-  email TEXT NOT NULL,
+  email TEXT,
   status TEXT NOT NULL,
   created_at TEXT NOT NULL,
   approved_at TEXT,
   expires_at TEXT,
-  plan TEXT
+  plan TEXT NOT NULL
 );
 """
 
@@ -77,9 +79,11 @@ async def db_init():
 
         # Migrações simples (caso o DB já exista antigo)
         for stmt in [
+            "ALTER TABLE payments ADD COLUMN email TEXT",
             "ALTER TABLE payments ADD COLUMN approved_at TEXT",
             "ALTER TABLE payments ADD COLUMN expires_at TEXT",
             "ALTER TABLE payments ADD COLUMN plan TEXT",
+            "ALTER TABLE payments ADD COLUMN id INTEGER",
         ]:
             try:
                 await db.execute(stmt)
@@ -88,19 +92,17 @@ async def db_init():
 
         await db.commit()
 
-async def db_insert_payment(mp_payment_id: str, telegram_id: int, email: str, status: str, plan: str):
+async def db_create_pending(telegram_id: int, plan: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT OR REPLACE INTO payments(
-              mp_payment_id, telegram_id, email, status, created_at, approved_at, expires_at, plan
-            ) VALUES (?,?,?,?,?,?,?,?)
+            INSERT INTO payments(telegram_id, email, status, created_at, approved_at, expires_at, plan)
+            VALUES (?,?,?,?,?,?,?)
             """,
             (
-                mp_payment_id,
                 telegram_id,
-                email,
-                status,
+                None,
+                "pending",
                 datetime.now(timezone.utc).isoformat(),
                 None,
                 None,
@@ -109,50 +111,21 @@ async def db_insert_payment(mp_payment_id: str, telegram_id: int, email: str, st
         )
         await db.commit()
 
-async def db_get_payment(mp_payment_id: str):
+async def db_attach_email_latest(telegram_id: int, email: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT mp_payment_id, telegram_id, email, status, created_at, approved_at, expires_at, plan
-            FROM payments
-            WHERE mp_payment_id=?
-            """,
-            (mp_payment_id,)
-        )
-        row = await cur.fetchone()
-        await cur.close()
-        return row
-
-async def db_update_status(mp_payment_id: str, status: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE payments SET status=? WHERE mp_payment_id=?",
-            (status, mp_payment_id)
-        )
-        await db.commit()
-
-async def db_mark_approved(mp_payment_id: str, plan: str):
-    now = datetime.now(timezone.utc)
-
-    # Vitalícia: expires_at = NULL
-    if plan == "life":
-        expires = None
-    else:
-        expires = now + timedelta(days=SUB_DAYS)
-
-    async with aiosqlite.connect(DB_PATH) as db:
+        # atualiza o registro mais recente pending/qualquer do usuário
         await db.execute(
             """
             UPDATE payments
-            SET status=?, approved_at=?, expires_at=?
-            WHERE mp_payment_id=?
-            """,
-            (
-                "approved",
-                now.isoformat(),
-                (expires.isoformat() if expires else None),
-                mp_payment_id
+            SET email=?
+            WHERE id = (
+              SELECT id FROM payments
+              WHERE telegram_id=?
+              ORDER BY created_at DESC
+              LIMIT 1
             )
+            """,
+            (email, telegram_id)
         )
         await db.commit()
 
@@ -160,7 +133,7 @@ async def db_get_latest_by_telegram(telegram_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            SELECT mp_payment_id, telegram_id, email, status, created_at, approved_at, expires_at, plan
+            SELECT id, telegram_id, email, status, created_at, approved_at, expires_at, plan
             FROM payments
             WHERE telegram_id=?
             ORDER BY created_at DESC
@@ -172,54 +145,52 @@ async def db_get_latest_by_telegram(telegram_id: int):
         await cur.close()
         return row
 
+async def db_get_latest_by_email(email: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, telegram_id, email, status, created_at, approved_at, expires_at, plan
+            FROM payments
+            WHERE email=?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (email,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return row
+
+async def db_mark_approved(row_id: int, plan: str):
+    now = datetime.now(timezone.utc)
+    if plan == "life":
+        expires = None
+    else:
+        expires = now + timedelta(days=SUB_DAYS)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE payments
+            SET status=?, approved_at=?, expires_at=?
+            WHERE id=?
+            """,
+            (
+                "approved",
+                now.isoformat(),
+                (expires.isoformat() if expires else None),
+                row_id
+            )
+        )
+        await db.commit()
+
 
 # =========================
-# Mercado Pago helpers
+# Helpers
 # =========================
-MP_BASE = "https://api.mercadopago.com"
-
 def is_valid_email(email: str) -> bool:
     email = email.strip()
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
-
-async def mp_create_pix_payment(amount: float, description: str, payer_email: str, external_ref: str):
-    """
-    Cria pagamento PIX.
-    Retorna: (payment_id, copia_e_cola, qr_base64, status)
-    """
-    headers = {
-        "Authorization": f"Bearer {MP_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-        "X-Idempotency-Key": external_ref,
-    }
-    payload = {
-        "transaction_amount": round(float(amount), 2),
-        "description": description,
-        "payment_method_id": "pix",
-        "payer": {"email": payer_email},
-        "external_reference": external_ref,
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{MP_BASE}/v1/payments", headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
-
-    payment_id = str(data.get("id"))
-    status = data.get("status", "unknown")
-
-    poi = data.get("point_of_interaction", {}) or {}
-    tx = poi.get("transaction_data", {}) or {}
-    copia_e_cola = tx.get("qr_code", "")
-    qr_base64 = tx.get("qr_code_base64", "")
-
-    return payment_id, copia_e_cola, qr_base64, status
-
-async def mp_get_payment(payment_id: str):
-    headers = {"Authorization": f"Bearer {MP_ACCESS_TOKEN}"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f"{MP_BASE}/v1/payments/{payment_id}", headers=headers)
-        r.raise_for_status()
-        return r.json()
 
 
 # =========================
@@ -265,7 +236,7 @@ async def cmd_planos(msg: Message):
         f"💎 *PLANOS DISPONÍVEIS*\n\n"
         f"🗓 *30 dias de acesso* — R$ {PRICE_30:.2f}\n"
         f"♾ *Acesso vitalício* — R$ {PRICE_LIFE:.2f}\n\n"
-        f"Pagamento via PIX com liberação automática 🔓",
+        f"Pagamento via Kiwify com liberação automática 🔓",
         parse_mode="Markdown",
         reply_markup=kb_main()
     )
@@ -313,13 +284,20 @@ async def cb_back(c: CallbackQuery):
 @dp.callback_query(F.data.in_(["buy_30", "buy_life"]))
 async def cb_choose_plan(c: CallbackQuery, state: FSMContext):
     plan = "30d" if c.data == "buy_30" else "life"
-    await state.update_data(plan=plan)
+    label = "30 dias" if plan == "30d" else "Vitalícia"
+    link = KIWIFY_LINK_30 if plan == "30d" else KIWIFY_LINK_LIFE
+
+    # cria um "pedido pendente" no DB
+    await db_create_pending(c.from_user.id, plan)
+
+    # pede email para casar com o pagamento do webhook
+    await state.update_data(plan=plan, link=link, label=label)
     await state.set_state(BuyFlow.waiting_email)
 
-    texto = "30 dias" if plan == "30d" else "Vitalícia"
     await c.message.answer(
-        f"✅ Você escolheu: *{texto}*\n\n"
-        "Agora me envie seu *e-mail* (obrigatório pelo Mercado Pago).",
+        f"🛒 Você escolheu: *{label}*\n\n"
+        "✅ Para eu liberar automaticamente, me envie o *mesmo e-mail* que você vai usar no checkout da Kiwify.\n\n"
+        "Exemplo: nome@gmail.com",
         parse_mode="Markdown",
         reply_markup=kb_back()
     )
@@ -333,59 +311,19 @@ async def on_email(msg: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    plan = data.get("plan", "30d")
+    link = data.get("link", KIWIFY_LINK_30)
+    label = data.get("label", "30 dias")
 
-    if plan == "life":
-        amount = PRICE_LIFE
-        description = f"{PRODUCT_NAME} (Vitalícia)"
-        plan_label = "Vitalícia"
-    else:
-        amount = PRICE_30
-        description = f"{PRODUCT_NAME} (30 dias)"
-        plan_label = "30 dias"
+    # salva email no último pedido do usuário
+    await db_attach_email_latest(msg.from_user.id, email)
 
-    telegram_id = msg.from_user.id
-    external_ref = f"tg{telegram_id}-{plan}-{int(datetime.now(timezone.utc).timestamp())}"
-
-    await msg.answer(f"⏳ Gerando seu PIX ({plan_label})...")
-
-    try:
-        mp_payment_id, copia, qr_b64, status = await mp_create_pix_payment(
-            amount=amount,
-            description=description,
-            payer_email=email,
-            external_ref=external_ref
-        )
-        await db_insert_payment(mp_payment_id, telegram_id, email, status, plan)
-    except Exception as e:
-        await msg.answer(f"❌ Erro ao gerar cobrança. Tente novamente.\n\nDetalhe: {type(e).__name__}")
-        await state.clear()
-        return
-
-    # Envia QR como imagem (se tiver)
-    if qr_b64:
-        try:
-            img_bytes = base64.b64decode(qr_b64)
-            photo = BufferedInputFile(img_bytes, filename="pix.png")
-            await msg.answer_photo(photo, caption="📷 QR Code PIX")
-        except Exception:
-            pass
-
-    # Envia copia e cola (MELHORADO)
-    if copia:
-        await msg.answer(
-            "💰 *Pagamento criado com sucesso!*\n\n"
-            "📋 *PIX Copia e Cola:*\n"
-            f"`{copia}`\n\n"
-            "⏳ Assim que o pagamento for confirmado, seu acesso será liberado automaticamente.\n\n"
-            "⚠️ Não feche esta conversa até finalizar o pagamento.",
-            parse_mode="Markdown"
-        )
-    else:
-        await msg.answer(
-            "✅ Cobrança criada! Aguarde a confirmação do pagamento.\n"
-            f"ID do pagamento: {mp_payment_id}"
-        )
+    await msg.answer(
+        f"✅ Perfeito! Agora finalize o pagamento no link abaixo:\n\n"
+        f"🛒 *Plano {label}*\n"
+        f"🔗 {link}\n\n"
+        "Assim que a Kiwify confirmar o pagamento, eu libero seu acesso automaticamente. 🚀",
+        parse_mode="Markdown"
+    )
 
     await state.clear()
 
@@ -395,14 +333,12 @@ async def cb_my_sub(c: CallbackQuery):
     row = await db_get_latest_by_telegram(telegram_id)
 
     if not row:
-        await c.message.answer("Você ainda não tem assinatura. Clique em 💳 Assinar para gerar o PIX.")
+        await c.message.answer("Você ainda não tem assinatura. Clique em 💳 Assinar para gerar o pagamento.")
         await c.answer()
         return
 
-    mp_id, tg_id, email, status, created_at, approved_at, expires_at, plan = row
-    plan = plan or "30d"
+    _id, tg_id, email, status, created_at, approved_at, expires_at, plan = row
 
-    # Se ainda não foi aprovado
     if status != "approved":
         await c.message.answer(
             "⏳ Encontrei um pedido seu, mas a assinatura ainda não está ativa.\n"
@@ -411,7 +347,6 @@ async def cb_my_sub(c: CallbackQuery):
         await c.answer()
         return
 
-    # Vitalícia
     if plan == "life":
         await c.message.answer(
             "💎 Sua assinatura é *VITALÍCIA*.\n"
@@ -422,7 +357,6 @@ async def cb_my_sub(c: CallbackQuery):
         await c.answer()
         return
 
-    # Mensal: precisa ter expires_at
     if not expires_at:
         await c.message.answer(
             "⚠️ Sua assinatura consta como aprovada, mas não encontrei a data de expiração.\n"
@@ -435,10 +369,13 @@ async def cb_my_sub(c: CallbackQuery):
     now = datetime.now(timezone.utc)
 
     if now < exp:
+        restante = exp - now
+        dias = max(restante.days, 0)
         await c.message.answer(
-            f"✅ *Assinatura ativa*\n"
-            f"📅 Válida até: *{exp.astimezone().strftime('%d/%m/%Y %H:%M')}*\n\n"
-            "Vou gerar um novo link de acesso para você 👇",
+            f"✅ Assinatura *ativa*\n"
+            f"📅 Expira em: *{exp.astimezone().strftime('%d/%m/%Y %H:%M')}*\n"
+            f"⏳ Restam: *{dias} dia(s)*\n\n"
+            "Vou gerar um link novo pra você entrar 👇",
             parse_mode="Markdown"
         )
         await grant_access(telegram_id)
@@ -454,14 +391,13 @@ async def cb_my_sub(c: CallbackQuery):
 
 
 # =========================
-# Telegram: liberar acesso (link 1 uso / 10 min)
+# Telegram: liberar acesso
 # =========================
 async def grant_access(telegram_id: int):
     if not CHANNEL_ID:
         await bot.send_message(
             telegram_id,
-            "⚠️ Pagamento aprovado, mas o administrador ainda não configurou o CHANNEL_ID do canal. "
-            "Peça ao admin para configurar e depois solicite suporte."
+            "⚠️ Pagamento aprovado, mas o administrador ainda não configurou o CHANNEL_ID do canal."
         )
         return
 
@@ -475,13 +411,9 @@ async def grant_access(telegram_id: int):
         )
         await bot.send_message(
             telegram_id,
-            "🎉 *Pagamento aprovado!*\n\n"
-            "🔓 Seu acesso está liberado.\n"
-            "Use o link abaixo para entrar no canal VIP:\n\n"
+            "✅ Aqui está seu link de acesso (1 uso / expira em 10 min):\n"
             f"{invite.invite_link}\n\n"
-            "⚠️ Este link expira em 10 minutos e só pode ser usado uma vez.\n"
-            "Se perder o acesso, toque em *📌 Minha assinatura*.",
-            parse_mode="Markdown"
+            "Se expirar, clique em 📌 Minha assinatura para gerar outro.",
         )
     except Exception:
         await bot.send_message(
@@ -492,58 +424,56 @@ async def grant_access(telegram_id: int):
 
 
 # =========================
-# FastAPI: webhook Mercado Pago
+# FastAPI: webhook Kiwify
 # =========================
-@app.post("/mp/webhook")
-@app.get("/mp/webhook")
-async def mp_webhook(request: Request):
-    params = dict(request.query_params)
-    payload = {}
+@app.post("/kiwify/webhook")
+async def kiwify_webhook(request: Request):
+    # Se você configurou um token no webhook da Kiwify, valide aqui:
+    if KIWIFY_WEBHOOK_TOKEN:
+        token = request.headers.get("X-Webhook-Token") or request.headers.get("x-webhook-token") or ""
+        if token.strip() != KIWIFY_WEBHOOK_TOKEN:
+            return JSONResponse({"ok": False, "error": "invalid_token"}, status_code=401)
+
+    data = {}
     try:
-        payload = await request.json()
+        data = await request.json()
     except Exception:
-        payload = {}
+        return JSONResponse({"ok": True})
 
-    payment_id: Optional[str] = None
-    topic = params.get("topic") or params.get("type") or payload.get("type")
+    # Campos comuns (podem variar — mas isso já cobre o básico)
+    status = (data.get("status") or "").lower()
+    customer = data.get("customer") or {}
+    email = (customer.get("email") or "").strip().lower()
 
-    if params.get("id"):
-        payment_id = params.get("id")
-    else:
-        data = payload.get("data") or {}
-        if isinstance(data, dict) and data.get("id"):
-            payment_id = str(data.get("id"))
-
-    if not payment_id:
+    # Aceita somente aprovado/paid
+    if status not in ("approved", "paid", "aprovado"):
         return JSONResponse({"ok": True, "ignored": True})
 
-    # Busca status real no MP
-    try:
-        mp_data = await mp_get_payment(payment_id)
-        status = mp_data.get("status", "unknown")
-    except Exception:
-        return JSONResponse({"ok": True, "error": "failed_to_fetch_payment"}, status_code=200)
+    if not email:
+        return JSONResponse({"ok": True, "missing_email": True})
 
-    # Atualiza DB e libera se aprovado
-    row = await db_get_payment(str(payment_id))
+    row = await db_get_latest_by_email(email)
     if not row:
-        return JSONResponse({"ok": True, "unknown_payment": True})
+        return JSONResponse({"ok": True, "user_not_found": True})
 
-    mp_id, telegram_id, email, old_status, created_at, approved_at, expires_at, plan = row
-    plan = plan or "30d"
+    row_id, telegram_id, _email, old_status, created_at, approved_at, expires_at, plan = row
 
-    if status != old_status:
-        await db_update_status(str(payment_id), status)
+    # só marca aprovado se ainda não estava
+    if old_status != "approved":
+        await db_mark_approved(row_id, plan)
 
-    # Marca expiração apenas na primeira vez que vira approved
-    if status == "approved" and old_status != "approved":
-        await db_mark_approved(str(payment_id), plan)
+    # libera acesso
+    await grant_access(int(telegram_id))
 
-    # Se aprovado, libera acesso (gera link)
-    if status == "approved":
-        await grant_access(int(telegram_id))
+    return JSONResponse({"ok": True})
 
-    return JSONResponse({"ok": True, "status": status, "topic": topic})
+
+# =========================
+# Healthcheck
+# =========================
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "telegram-vip-bot"}
 
 
 # =========================
@@ -553,7 +483,3 @@ async def mp_webhook(request: Request):
 async def on_startup():
     await db_init()
     asyncio.create_task(dp.start_polling(bot))
-
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "telegram-vip-bot"}
